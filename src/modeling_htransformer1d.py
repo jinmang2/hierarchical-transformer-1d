@@ -573,7 +573,7 @@ class _ReversibleFunction(Function):
     """
     To prevent PyTorch from performing the usual backpropagatio, a customized backward function is implemented here.
     This way it is made sure that no memory expensive activation are saved during the forward pass. This function is
-    heavily inspired by https://github.com/lucidrains/reformer-pytorch/blob/master/h_transformer_1d/reversible.py
+    heavily inspired by https://github.com/lucidrains/h-transformer-1d/blob/main/h_transformer_1d/reversible.py
     """
     
     @staticmethod
