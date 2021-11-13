@@ -81,5 +81,3 @@ class HTransformer1DConfig(PretrainedConfig):
         self.rotary_theta = rotary_theta
         self.learned_freq = learned_freq
         self.use_cache = use_cache
-        
-    
