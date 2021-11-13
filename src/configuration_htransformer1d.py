@@ -20,10 +20,10 @@ class HTransformer1DConfig(PretrainedConfig):
     def __init__(
         self,
         vocab_size=50000,
-        hidden_size=512,
+        hidden_size=768,
         num_hidden_layers=12,
-        num_attention_heads=8,
-        intermediate_size=2048,
+        num_attention_heads=12,
+        intermediate_size=3072,
         hidden_act="gelu",
         hidden_dropout_prob=0.1,
         
@@ -41,7 +41,8 @@ class HTransformer1DConfig(PretrainedConfig):
         rotary_value=False, # value도 rotary를 적용할 지 안할지
         rotary_theta=10000,
         learned_freq=False,
-        use_cache=True,
+        # use_cache=True,
+        position_embedding_type="rotary",
         **kwargs
     ):
         super().__init__(pad_token_id=pad_token_id, **kwargs)
@@ -58,6 +59,10 @@ class HTransformer1DConfig(PretrainedConfig):
             'hidden size must be divisible by the number of attention heads'
         )
         
+        assert position_embedding_type in ['absolute', 'rotary'], (
+            'position embedding type must be either \'absolute\' or \'rotary\''
+        )
+        
         # Is same 
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -65,7 +70,6 @@ class HTransformer1DConfig(PretrainedConfig):
         self.dim_head = hidden_size // num_attention_heads
         self.num_attention_heads = num_attention_heads
         self.hidden_act = hidden_act
-        self.pre_layernorm = pre_layernorm
         self.intermediate_size = intermediate_size
         self.hidden_dropout_prob = hidden_dropout_prob
         self.attention_probs_dropout_prob = attention_probs_dropout_prob
@@ -80,4 +84,4 @@ class HTransformer1DConfig(PretrainedConfig):
         self.rotary_value = rotary_value
         self.rotary_theta = rotary_theta
         self.learned_freq = learned_freq
-        self.use_cache = use_cache
+        # self.use_cache = use_cache
