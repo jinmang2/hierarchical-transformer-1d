@@ -37,6 +37,7 @@ class HTransformer1DConfig(PretrainedConfig):
         type_vocab_size=2,
         initializer_range=0.02,
         layer_norm_eps=1e-12,
+        attn_eps=1e-8,
         pad_token_id=0,
         rotary_value=False, # value도 rotary를 적용할 지 안할지
         rotary_theta=10000,
@@ -63,7 +64,6 @@ class HTransformer1DConfig(PretrainedConfig):
             'position embedding type must be either \'absolute\' or \'rotary\''
         )
         
-        # Is same 
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
@@ -81,7 +81,9 @@ class HTransformer1DConfig(PretrainedConfig):
         self.type_vocab_size = type_vocab_size
         self.initializer_range = initializer_range
         self.layer_norm_eps = layer_norm_eps
+        self.attn_eps = attn_eps
         self.rotary_value = rotary_value
         self.rotary_theta = rotary_theta
         self.learned_freq = learned_freq
         # self.use_cache = use_cache
+        self.position_embedding_type = position_embedding_type

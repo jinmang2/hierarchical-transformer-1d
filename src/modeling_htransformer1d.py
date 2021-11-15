@@ -1,4 +1,5 @@
 import sys
+from math import log2, ceil
 from inspect import isfunction
 from collections import namedtuple
 
@@ -34,21 +35,16 @@ _CONFIG_FOR_DOC = "HTransformer1DConfig"
 _TOKENIZER_FOR_DOC = "HTransformer1DTokenizer"
 
 # Define named tuples for nn.Modules here
-HTransformer1DOutput = namedtuple(
-    "HTransformer1DOutput", 
-    ["hidden_states", "attn_output", "attention_probs"]
+AttentionOutput = namedtuple("AttentionOutput", ["hidden_states", "attentions"])
+HTransformer1DLayerOutput = namedtuple(
+    "HTransformer1DLayerOutput", 
+    ["hidden_states", "attn_output", "attentions"]
 )
 HTransformer1DBackwardOutput = namedtuple(
     "HTransformer1DBackwardOutput",
     ["attn_output", "hidden_states", "grad_attn_output", "grad_hidden_states"]
 )
 
-"""
-@TODO
-1. Attention class 만들기
-2. 모듈이 정상적으로 동작하는지 확인하기
-3. head module 만들기
-"""
 
 # hierarchical attention helper functions
 
@@ -64,8 +60,9 @@ def flip_every_two(t):
 class HTransformer1DRotaryEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         theta = config.rotary_theta
-        dim = config.hidden_size
+        dim = config.dim_head
         freqs = 1. / (theta ** torch.arange(0, dim, 2)[:(dim // 2)].float() / dim)
         self.cache = dict()
         
@@ -83,7 +80,7 @@ class HTransformer1DRotaryEmbedding(nn.Module):
             
         freqs = self.freqs
         
-        freqs = torch.einsum('..., f -> ... f', t.type(freqs.dtype), freqs)
+        freqs = einsum('..., f -> ... f', t.type(freqs.dtype), freqs)
         freqs = repeat(freqs, '... n -> ... (n r)', r=2)
         
         if cache_key is not None:
@@ -91,10 +88,18 @@ class HTransformer1DRotaryEmbedding(nn.Module):
             
         return freqs
     
+    def extra_repr(self):
+        extra_repr = (
+            f"dim={self.config.dim_head}, "
+            f"theta={self.config.rotary_theta}, "
+            f"learned_freq={self.config.learned_freq}"
+        )
+        return extra_repr
+    
     @staticmethod
     def apply_rotary_emb(freqs, t, start_index=0):
         rot_dim = freqs.shape[-1]
-        end_index = start_idx + rot_dim
+        end_index = start_index + rot_dim
         assert rot_dim <= t.shape[-1], (
             f'feature dimension {t.shape[-1]} is not of sufficient '
             f'size to rotate in all the positions {rot_dim}'
@@ -178,7 +183,7 @@ class HTransformer1DEmbeddings(nn.Module):
         # The series of casts and type-conversions here are carefully balanced to both work with ONNX export and XLA.
         mask = input_ids.ne(self.padding_idx).int()
         incremental_indices = (torch.cumsum(mask, dim=1).type_as(mask) + past_key_values_length) * mask
-        return incremental_indices.long() + padding_idx
+        return incremental_indices.long() + self.padding_idx
     
     def create_position_ids_from_inputs_embeds(self, inputs_embeds):
         """
@@ -196,42 +201,187 @@ class HTransformer1DEmbeddings(nn.Module):
         return position_ids.unsqueeze(0).expand(input_shape)
 
 
-class HTransformer1DSelfAttention(nn.Module):
-    def __init__(self, config):
-        embed_positions = HTransformer1DRotaryEmbedding(config)
-        pass
-    
-    def forward(self):
-        pass
-    
-
+# lucidrains/h-transformer-1d
+# h_transformer_1d/h_transformer_1d.py#L100
 class HTransformer1DAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.self = HTransformer1DSelfAttention(config)
-        self.pruned_heads = set()
+        self.block_size = config.block_size
+        self.heads = config.num_attention_heads
+        self.dim_head = config.dim_head
+        self.eps = config.attn_eps
+        self.scale = self.dim_head ** -0.5
+        self.position_embedding_type = config.position_embedding_type
+        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         
-    # Copied from transformers.models.bert.modeling_bert.BertAttention.prune_heads
-    def prune_heads(self, heads):
-        if len(heads) == 0:
-            return
-        heads, index = find_pruneable_heads_and_indices(
-            heads, self.self.num_attention_heads, self.self.attention_head_size, self.pruned_heads
-        )
-
-        # Prune linear layers
-        self.self.query = prune_linear_layer(self.self.query, index)
-        self.self.key = prune_linear_layer(self.self.key, index)
-        self.self.value = prune_linear_layer(self.self.value, index)
-        self.output.dense = prune_linear_layer(self.output.dense, index, dim=1)
-
-        # Update hyper params and store pruned heads
-        self.self.num_attention_heads = self.self.num_attention_heads - len(heads)
-        self.self.all_head_size = self.self.attention_head_size * self.self.num_attention_heads
-        self.pruned_heads = self.pruned_heads.union(heads)
+        inner_dim = self.heads * self.dim_head
+        
+        self.to_qkv = nn.Linear(config.hidden_size, inner_dim * 3, bias=False)
+        self.to_out = nn.Linear(inner_dim, config.hidden_size)
+        
+        if self.position_embedding_type == "rotary":
+            # Whether or not to apply rotary to value
+            self.rotary_value = config.rotary_value
+            self.pos_emb = HTransformer1DRotaryEmbedding(config)
+        
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        head_mask=None,
+        output_attentions=None,
+    ):
+        batch_size, seq_length = hidden_states.shape[:2]
+        # pad sequence length to power of 2
+        if seq_length >= self.block_size * 2:
+            pad_to_len = 2 ** ceil(log2(seq_length))
+        else:
+            pad_to_len = self.block_size * 2
+        padding = pad_to_len - seq_length
+        
+        # PreLN architectures
+        hidden_states = self.layer_norm(hidden_states)
+        
+        if padding != 0:
+            hidden_states = F.pad(hidden_states, (0, 0, 0, padding), value=0.)
+            if attention_mask is not None:
+                attention_mask = F.pad(attention_mask, (0, padding), value=False)
+        
+        # derive queries, keys, values
+        q, k, v = self.to_qkv(hidden_states).chunk(3, dim=-1)
+        
+        # split out heads, and also divide sequence into blocks
+        to_heads = lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=self.heads)
+        q, k, v = map(to_heads, (q, k, v))
+        
+        if attention_mask is not None:
+            attention_mask = repeat(attention_mask, 'b n -> (b h) n', h=self.heads)
+            
+        # scale
+        q = q * self.scale
+        
+        # rotary pos emb
+        if self.position_embedding_type == "rotary":
+            add_to_pad = torch.arange(pad_to_len, device=q.device)
+            freqs = self.pos_emb(add_to_pad, cache_key=pad_to_len)
+            freqs = rearrange(freqs, 'n d -> () n d')
+            apply_rotary_emb = self.pos_emb.apply_rotary_emb
+            q, k = map(lambda t: apply_rotary_emb(freqs, t), (q, k))
+            if self.rotary_value:
+                v = apply_rotary_emb(freqs, v)
+            
+        # calculate number of levels until 2 x 2
+        num_levels = int(log2(pad_to_len // self.block_size)) - 1
+        assert num_levels >= 0, 'number of levels must be at least greater than 0'
+        
+        # coarsening
+        qkvs = [(q, k, v, attention_mask)]
+        for level in range(num_levels):
+            coarsened_qkvs = self.coarsen(*qkvs[-1])
+            qkvs.append(coarsened_qkvs)
+        qkvs = [qkvs[0], *qkvs] # duplicate the finest resolution an extra time, for the base diagonal
+        
+        to_blocks = lambda t: rearrange(t, 'b (n z) ... -> b n z ...', z = self.block_size)
+        # calculate Ys, ad in the paper
+        Ys = []
+        for ind, (q, k, v, mask) in enumerate(reversed(qkvs)):
+            is_last = ind == (len(qkvs) - 1)            
+            q, k, v = map(to_blocks, (q, k, v))
+            
+            # generate the mask for S
+            S_mask = None
+            if mask is not None:
+                mask = to_blocks(mask)
+                q_mask = mask
+                k_mask = flip_every_two(mask) if not is_last else mask
+                S_mask = rearrange(q_mask, '... n -> ... n ()') * rearrange(k_mask, '... n -> ... () n')
+                
+            # flip keys and values to capture the off-diagonal
+            if not is_last:
+                k, v = map(flip_every_two, (k, v))
+                
+            y, A = self.compute_Y_and_A(q, k, v, mask=S_mask)
+            Ys.append((y, A))
+            
+        # interpolate
+        Y, A, attentions = 0, 0, 0
+        for ind, (Y_level, A_level) in enumerate(Ys):
+            is_last = ind == (len(Ys) - 1)
+            
+            if not is_last and torch.is_tensor(Y):
+                Y = repeat(Y, 'b n d -> b (n r) d', r=2)
+                
+            if not is_last and torch.is_tensor(A):
+                A = repeat(A, 'b n -> b (n r)', r=2)
+                
+            Y = Y_level + Y
+            A = A_level + A
+            
+        out = Y / rearrange(A + self.eps, 'b n -> b n ()')
+        # merge heads
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=self.heads)
+        # combine out
+        hidden_states = self.to_out(out[:, :seq_length])
     
-    def forward(self):
-        pass
+        return AttentionOutput(
+            hidden_states=hidden_states,
+            attentions=None, # Not implemented
+        )
+    
+    @staticmethod
+    def coarsen(q, k, v, mask=None):
+        to_coarse = lambda t: rearrange(t, 'b (n r) d -> b n r d', r=2)
+        q, k, v = map(to_coarse, (q, k, v))
+        if mask is not None:
+            mask = repeat(mask, 'b (n r) -> b n r', r=2)
+            
+        # masked mean for queries and keys, but not values
+        def masked_aggregate(tensor, mask=None, dim=-1, average=True):
+            if mask is None:
+                fn = torch.sum if not average else torch.mean
+                return fn(tensor, dim=dim)
+            
+            diff_len = len(tensor.shape) - len(mask.shape)
+            mask = mask[(..., *((None,) * diff_len))]
+            tensor = tensor.masked_fill(~mask, 0.)
+            
+            total_el = mask.sum(dim=dim)
+            agg = tensor.sum(dim=dim)
+            
+            if average:
+                agg = agg / total_el.clamp(min=1.)
+                
+            agg.masked_fill_(total_el == 0, 0.)
+            return agg
+        
+        q = masked_aggregate(q, mask, dim=2)
+        k = masked_aggregate(k, mask, dim=2)
+        v = masked_aggregate(v, mask, dim=2, average=False)
+        
+        if mask is not None:
+            mask = torch.any(mask, dim=2)
+            
+        return (q, k, v, mask)
+    
+    @staticmethod
+    def compute_Y_and_A(q, k, v, mask=None):
+        S = einsum('... i d, ... j d -> ... i j', q, k)
+        
+        if mask is not None:
+            mask_value = -torch.finfo(S.dtype).max
+            S = S.masked_fill(~mask, mask_value)
+            
+        S = S - torch.max(S, dim=-1, keepdim=True).values
+        A = S.exp()
+        
+        y = einsum('... i j, ... j d -> ... i d', A, v)
+        
+        A = A.sum(dim=-1)
+        
+        y = rearrange(y, 'b ... n d -> b (... n) d')
+        A = rearrange(A, 'b ... i -> b (... i)')
+        
+        return y, A
 
 
 class HTransformer1DIntermediate(nn.Module):
@@ -274,7 +424,7 @@ class ChunkHTransformer1DFeedForward(nn.Module):
         self.dense = HTransformer1DIntermediate(config)
         self.output = HTransformer1DOutput(config)
 
-    def forward(self, attention_output):
+    def forward(self, attention_output, **kwargs):
         return apply_chunking_to_forward(
             self.forward_chunk,
             self.chunk_size_feed_forward,
@@ -314,7 +464,7 @@ class PreShiftToken(nn.Module):
             shifts = self.shifts
             segments = len(shifts)
             feats_per_shift = hidden_states.shape[-1] // segments
-            splitted = x.split(feats_per_shift, dim=-1)
+            splitted = hidden_states.split(feats_per_shift, dim=-1)
             segments_to_shift, rest = splitted[:segments], splitted[segments:]
             segments_to_shift = list(
                 map(lambda args: self._shift(*args, mask=mask), 
@@ -325,8 +475,11 @@ class PreShiftToken(nn.Module):
         return self.fn(hidden_states, **kwargs)
     
     def __repr__(self):
-        cls_name = self.__class__.__name__
-        return cls_name + " " + self.module.__repr__()
+        fn_repr = self.fn.__repr__()
+        if self.config.shift_tokens:
+            cls_name = self.__class__.__name__
+            fn_repr = cls_name + " " + fn_repr
+        return fn_repr
     
     
 class HTransformer1DSequentialLayer(nn.Module):
@@ -355,10 +508,10 @@ class HTransformer1DSequentialLayer(nn.Module):
         layer_outputs = self.feed_forward(attn_output)
         hidden_states = attn_output + layer_outputs
         
-        return HTransformer1DOutput(
+        return HTransformer1DLayerOutput(
             attn_output=attn_output,
             hidden_states=hidden_states,
-            attention_probs=attn_outputs.attention_probs,
+            attentions=attn_outputs.attentions
         )
 
     
@@ -446,10 +599,10 @@ class HTransformer1DReversibleLayer(nn.Module):
             # Y_2 = X_2 + g(Y_1)
             hidden_states = hidden_states + self.feed_forward(attn_output)
             
-        return HTransformer1DOutput(
+        return HTransformer1DLayerOutput(
             attn_output=attn_output,
             hidden_states=hidden_states,
-            attention_probs=attn_outputs.attention_probs,
+            attentions=attn_outputs.attentions
         )
     
     def backward_pass(
@@ -526,9 +679,9 @@ class HTransformer1DSequentialEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        layer = nn.ModuleList([])
+        self.layers = nn.ModuleList([])
         for _ in range(config.num_hidden_layers):
-            layer.append(HTransformer1DSequentialLayer(config))
+            self.layers.append(HTransformer1DSequentialLayer(config))
     
     def forward(
         self,
@@ -539,9 +692,9 @@ class HTransformer1DSequentialEncoder(nn.Module):
         output_hidden_states=False,
     ):
         all_hidden_states = () if output_hidden_states else None
-        all_self_attentions = () if output_attentions else None
+        all_attentions = () if output_attentions else None
         
-        for layer, layer_head_mask in zip(layers, head_mask):
+        for layer, layer_head_mask in zip(self.layers, head_mask):
             if output_hidden_states is not None:
                 all_hidden_states = all_hidden_states + (hidden_states,)
                 
@@ -556,7 +709,7 @@ class HTransformer1DSequentialEncoder(nn.Module):
             hidden_states = layer_outputs.hidden_states
             
             if output_attentions:
-                all_attentions.append(layer_outputs.attention_probs)
+                all_attentions.append(layer_outputs.attentions)
                 
         # Add last layer
         if output_hidden_states is True:
@@ -565,7 +718,7 @@ class HTransformer1DSequentialEncoder(nn.Module):
         return BaseModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
-            attentions=all_self_attentions,
+            attentions=all_attentions,
         )
 
 
@@ -583,6 +736,8 @@ class _ReversibleFunction(Function):
         layers,
         attention_mask,
         head_mask,
+        all_hidden_states,
+        all_attentions,
         output_hidden_states,
         output_attentions
     ):
@@ -590,7 +745,7 @@ class _ReversibleFunction(Function):
         hidden_states, attn_output = torch.chunk(hidden_states, 2, dim=-1)
         
         for layer, layer_head_mask in zip(layers, head_mask):
-            if output_hidden_states is not None:
+            if output_hidden_states is True:
                 all_hidden_states.append(hidden_states)
             layer_outputs = layer(
                 prev_attn_output=attn_output,
@@ -604,7 +759,7 @@ class _ReversibleFunction(Function):
             hidden_states = layer_outputs.hidden_states
             
             if output_attentions:
-                all_attentions.append(layer_outputs.attention_probs)
+                all_attentions.append(layer_outputs.attentions)
                 
         # Add last layer
         if output_hidden_states is True:
@@ -669,9 +824,9 @@ class HTransformer1DReversibleEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        layer = nn.ModuleList([])
+        self.layers = nn.ModuleList([])
         for _ in range(config.num_hidden_layers):
-            layer.append(HTransformer1DReversibleLayer(config))
+            self.layers.append(HTransformer1DReversibleLayer(config))
     
     def forward(
         self,
@@ -682,17 +837,19 @@ class HTransformer1DReversibleEncoder(nn.Module):
         output_hidden_states=False,
     ):
         all_hidden_states = [] if output_hidden_states else None
-        all_self_attentions = [] if output_attentions else None
+        all_attentions = [] if output_attentions else None
         
         # concat same tensor for reversible ResNet [X1, X2]
         hidden_states = torch.cat([hidden_states, hidden_states], dim=-1)
         hidden_states = _ReversibleFunction.apply(
-            hidden_states=hidden_states,
-            layers=self.layers,
-            attention_mask=attention_mask,
-            head_mask=head_mask,
-            output_hidden_states=output_hidden_states,
-            output_attentions=output_attentions,
+            hidden_states,
+            self.layers,
+            attention_mask,
+            head_mask,
+            all_hidden_states,
+            all_attentions,
+            output_hidden_states,
+            output_attentions,
         )
         # attn_output + hidden_states
         hidden_states = torch.stack(hidden_states.chunk(2, dim=-1)).sum(dim=0)
@@ -700,7 +857,7 @@ class HTransformer1DReversibleEncoder(nn.Module):
         return BaseModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
-            attentions=all_self_attentions,
+            attentions=all_attentions,
         )        
 
 
@@ -765,7 +922,7 @@ class HTransformer1DPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
-        elif isinstance(module, HTransformer1DSinusoidalPositionalEmbedding):
+        elif isinstance(module, HTransformer1DRotaryEmbedding):
             pass
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
@@ -783,9 +940,9 @@ class HTransformer1DModel(HTransformer1DPreTrainedModel):
         
         self.embeddings = HTransformer1DEmbeddings(config)
         if config.reversible:
-            self.encoder = HTransformer1DSequentialEncoder(config)
-        else:
             self.encoder = HTransformer1DReversibleEncoder(config)
+        else:
+            self.encoder = HTransformer1DSequentialEncoder(config)
         
         self.init_weights()
         
@@ -807,6 +964,7 @@ class HTransformer1DModel(HTransformer1DPreTrainedModel):
         self,
         input_ids=None,
         attention_mask=None,
+        token_type_ids=None,
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
@@ -835,12 +993,13 @@ class HTransformer1DModel(HTransformer1DPreTrainedModel):
         
         if attention_mask is None:
             attention_mask = torch.ones(((batch_size, seq_length)), device=device)
+        attention_mask = attention_mask.to(torch.bool)
         if token_type_ids is None:
             token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
         
         # Prepare head mask if needed
         # 1.0 in head_mask indicate we keep the head
-        # attention_probs has shape bsz x n_heads x N x N
+        # attentions has shape bsz x n_heads x N x N
         # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
         # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
